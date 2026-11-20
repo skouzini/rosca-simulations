@@ -18,9 +18,9 @@ class PopulationParams:
     rent_median: float = 1350.0           # $/mo. ASSUMPTION — verify HUD FMR / ACS
     rent_sigma: float = 0.15
     essentials_monthly: float = 900.0     # $/mo non-rent essentials. ASSUMPTION
-    buffer_median: float = 300.0          # starting liquid cash. SHED 2024: 37% can't cover $400
+    buffer_median: float = 600.0          # starting liquid cash. SHED 2024: 37% can't cover $400 (calibrated; lognormal σ=1 → 34% < $400)
     buffer_sigma: float = 1.0
-    payday_propensity: float = 0.7        # P(take payday | short). ASSUMPTION (present bias)
+    payday_propensity: float = 0.5        # P(take payday | short). ASSUMPTION (present bias) (calibrated)
     strategic_default_prob: float = 0.01  # per-cycle walk-away after payout. MAF ~0.7–1%
 
 
@@ -41,7 +41,7 @@ class PaydayParams:
     max_weeks: int = 10                   # Utah Code 7-23: 10-week limit, then extended payment plan
     epp_weeks: int = 8                    # extended payment plan length (interest-free installments)
     renew_prob: float = 0.8               # CFPB 2014: >80% renewed within 14 days
-    default_prob_when_unable: float = 0.25  # P(default | can't pay or renew). calibrate to ~20%/yr borrowers
+    default_prob_when_unable: float = 0.3  # P(default | can't pay or renew). calibrate to ~20%/yr borrowers (calibrated)
 
 
 StructureName = Literal["no_pool", "rigid", "variable_payout", "reserve_staking"]
