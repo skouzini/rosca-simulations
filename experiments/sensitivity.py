@@ -9,7 +9,9 @@ preset and without it, then record per structure:
   pool_mttr       median weeks until the pool health index is back to the no-shock run
 Factor effects = Spearman rank correlation of each factor with each outcome, per structure.
 
-    python3 -m experiments.sensitivity [n_samples=300] [n_runs=20] [preset="Plant layoff"]
+    python3 -m experiments.sensitivity [n_samples=300] [n_runs=20] [preset="Plant layoff"] [weeks=104]
+
+Use 104 weeks: with a 52-week horizon most post-shock recoveries are cut off (right-censored).
 
 Writes results/sensitivity.parquet (one row per sample × structure) and results/sensitivity_effects.parquet.
 """
@@ -69,8 +71,8 @@ def params_for(row: dict, base: SimParams) -> SimParams:
 
 
 def evaluate(args) -> list[dict]:
-    i, row, n_runs, preset = args
-    p = params_for(row, SimParams())
+    i, row, n_runs, preset, weeks = args
+    p = params_for(row, SimParams(weeks=weeks))
     shocks = PRESETS[preset]
     s = summarize_many(run_many(p, STRUCTS, shocks, n_runs, seed=1000 * i), p.pool, p.population.cohort_size,
                        calm=run_many(p, STRUCTS, [], n_runs, seed=1000 * i))
@@ -78,17 +80,17 @@ def evaluate(args) -> list[dict]:
     base_fees = g.payday_fees.mean()["no_pool"]
     out = []
     for st in STRUCTS[1:]:
-        out.append(dict(sample=i, structure=st, **row,
+        out.append(dict(sample=i, structure=st, weeks=weeks, **row,
                         fee_reduction=1 - g.payday_fees.mean()[st] / base_fees if base_fees > 0 else 0.0,
                         survival=g.survived.mean()[st], member_mttr=g.member_mttr_weeks.median()[st],
                         member_recovered=g.member_recovered.mean()[st], pool_mttr=g.mttr_weeks.median()[st]))
     return out
 
 
-def run_sensitivity(n_samples: int = 300, n_runs: int = 20, preset: str = "Plant layoff",
+def run_sensitivity(n_samples: int = 300, n_runs: int = 20, preset: str = "Plant layoff", weeks: int = 104,
                     workers: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     X = sample_factors(n_samples)
-    jobs = [(i, X.iloc[i].to_dict(), n_runs, preset) for i in range(n_samples)]
+    jobs = [(i, X.iloc[i].to_dict(), n_runs, preset, weeks) for i in range(n_samples)]
     with ProcessPoolExecutor(workers) as ex:
         rows = [r for chunk in ex.map(evaluate, jobs, chunksize=4) for r in chunk]
     df = pd.DataFrame(rows)
@@ -113,12 +115,13 @@ if __name__ == "__main__":
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 300
     runs = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     preset = sys.argv[3] if len(sys.argv) > 3 else "Plant layoff"
-    df, eff = run_sensitivity(n, runs, preset)
+    weeks = int(sys.argv[4]) if len(sys.argv) > 4 else 104
+    df, eff = run_sensitivity(n, runs, preset, weeks)
     OUT.mkdir(exist_ok=True)
     df.to_parquet(OUT / "sensitivity.parquet")
     eff.to_parquet(OUT / "sensitivity_effects.parquet")
     pd.set_option("display.width", 200)
     for o in OUTCOMES:
         t = eff[eff.outcome == o].pivot(index="factor", columns="structure", values="rho")
-        print(f"\n== Spearman rho with {o} ({preset}, {n} samples × {runs} runs)")
+        print(f"\n== Spearman rho with {o} ({preset}, {n} samples × {runs} runs, {weeks} weeks)")
         print(t.reindex(t.abs().max(axis=1).sort_values(ascending=False).index).round(2).to_string())

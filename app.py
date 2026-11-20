@@ -371,9 +371,10 @@ with tab_sens:
     else:
         raw, eff = pd.read_parquet(res / "sensitivity.parquet"), pd.read_parquet(res / "sensitivity_effects.parquet")
         n_samp = raw["sample"].nunique()
+        horizon = int(raw["weeks"].iloc[0]) if "weeks" in raw else 52
         st.markdown(f"**What drives shock resistance and recovery?** {n_samp} randomly sampled scenarios "
                     "(Latin hypercube over every factor below, timing-mismatch population, plant-layoff shock), each "
-                    "run on the same seeds for every structure, with and without the shock.")
+                    f"run for {horizon} weeks on the same seeds for every structure, with and without the shock.")
         c1, c2 = st.columns(2)
         outcome = c1.selectbox("Outcome", list(SENS_OUTCOMES), format_func=lambda k: SENS_OUTCOMES[k][0])
         sens_struct = c2.selectbox("Structure", [s for s in STRUCTURES if s != "no_pool"],
