@@ -77,6 +77,8 @@ def run(params: SimParams, structure: str, shocks: list[ShockEvent], seed: int) 
         walk = np.nonzero((out > 0) & state.active & (u_walk < pp.strategic_default_prob))[0]
         if walk.size:
             cash += pool.on_exit(walk, state)
+        if w == W - 1:  # horizon ends: return member-owned stakes (C only; zeros elsewhere)
+            cash += pool.release_stakes()
         book.end_week()
         # 7. record
         hit = shock_cost[w] > 0
@@ -116,15 +118,7 @@ def run(params: SimParams, structure: str, shocks: list[ShockEvent], seed: int) 
 def run_many(params: SimParams, structures: list[str], shocks: list[ShockEvent],
              n_runs: int, seed: int = 0) -> list[RunResult]:
     """Run n_runs seeds (seed, seed+1, ...) for each structure. Same seeds across structures."""
-    out = []
-    for s in structures:
-        runner = run
-        try:
-            run(params, s, shocks, seed)
-        except NotImplementedError:
-            runner = fake_run  # shortcut: remove fallback once all pools land
-        out += [runner(params, s, shocks, seed + i) for i in range(n_runs)]
-    return out
+    return [run(params, s, shocks, seed + i) for s in structures for i in range(n_runs)]
 
 
 # ---------------------------------------------------------------- fake data for dashboard development
