@@ -6,14 +6,22 @@ from .params import WEEKS_PER_YEAR, PopulationParams
 
 
 def make_population(p: PopulationParams, rng: np.random.Generator) -> AgentState:
-    """Lognormal wage/rent/starting buffer around their medians. Essentials are the same for everyone."""
+    """Lognormal wage/rent/starting buffer around their medians. budget_mode 'margin' instead sets each
+    agent's rent + essentials from their own pay so they run a thin surplus (see PopulationParams)."""
     n = p.cohort_size
     lognorm = lambda median, sigma: median * np.exp(rng.normal(0.0, sigma, n))
+    wage = lognorm(p.wage_median, p.wage_sigma)
+    rent = lognorm(p.rent_median, p.rent_sigma)
+    essentials = np.full(n, p.essentials_monthly)
+    margin = np.clip(rng.normal(p.margin_mean, p.margin_sd, n), 0.01, 0.25)  # drawn in both modes (same rng stream)
+    if p.budget_mode == "margin":
+        costs = wage * p.hours_mean * WEEKS_PER_YEAR / 12 * (1 - margin)
+        rent, essentials = costs * p.rent_share, costs * (1 - p.rent_share)
     return AgentState(
-        wage=lognorm(p.wage_median, p.wage_sigma),
+        wage=wage,
         hours_mean=np.full(n, p.hours_mean),
-        rent_monthly=lognorm(p.rent_median, p.rent_sigma),
-        essentials_weekly=np.full(n, p.essentials_monthly * 12 / WEEKS_PER_YEAR),
+        rent_monthly=rent,
+        essentials_weekly=essentials * 12 / WEEKS_PER_YEAR,
         cash=lognorm(p.buffer_median, p.buffer_sigma),
         payday_propensity=np.full(n, p.payday_propensity),
         active=np.ones(n, dtype=bool),

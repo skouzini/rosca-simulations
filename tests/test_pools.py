@@ -163,7 +163,7 @@ def test_own_stake_withdrawal_and_release():
 def test_snapshot_keys_and_types():
     for cls in (RigidROSCA, VariablePayout, ReserveStaking):
         snap = make(cls).snapshot()
-        assert set(snap) == {"reserve", "pot", "staked", "seed_drawn", "frozen", "collapsed"}
+        assert set(snap) == {"reserve", "pot", "staked", "personal", "seed_drawn", "frozen", "collapsed"}
         assert all(type(v) in (float, bool) for v in snap.values())
 
 
@@ -171,11 +171,13 @@ def test_snapshot_keys_and_types():
 @pytest.mark.parametrize("cls", [RigidROSCA, VariablePayout, ReserveStaking])
 @pytest.mark.parametrize("policy", ["expel", "demote"])
 @pytest.mark.parametrize("seed", range(5))
-def test_conservation_every_week(cls, policy, seed):
+@pytest.mark.parametrize("beta", [0.0, 0.25])
+def test_conservation_every_week(cls, policy, seed, beta):
     """Δholdings == paid_in − granted − payouts − refunds − lost reserve, every week."""
     rng = np.random.default_rng(seed)
     pool = make(cls, seed=seed, miss_policy=policy, seed_liquidity=200.0 * (seed % 2),
-                collapse_min_frac=0.3 if seed < 3 else 0.5, stake_cash_threshold=300)
+                collapse_min_frac=0.3 if seed < 3 else 0.5, stake_cash_threshold=300,
+                personal_share_frac=beta)
     s = make_state(cash=rng.uniform(0, 1500))
     for w in range(52):
         h0, flows = pool.holdings(), 0.0
@@ -199,3 +201,21 @@ def test_conservation_every_week(cls, policy, seed):
         assert pool.pot >= -1e-9 and pool.reserve >= -1e-9 and (out >= -1e-9).all()
         snap = pool.snapshot()
         assert pool.holdings() >= -1e-9 and 0 <= snap["seed_drawn"] <= pool.p.seed_liquidity + 1e-9
+
+
+# ---------------------------------------------------------------- personal emergency share (all structures)
+@pytest.mark.parametrize("cls", [RigidROSCA, VariablePayout, ReserveStaking])
+def test_personal_share_split_draw_and_refund(cls):
+    pool = make(cls, personal_share_frac=0.25)
+    s = make_state()
+    out = week(pool, s, 0) + week(pool, s, 1)                    # one full round
+    assert pool.personal == pytest.approx(np.full(N, 2 * C * 0.25))
+    assert pool.full_pot(s) == pytest.approx(FULL * 0.75 * (1 - pool.alpha))
+    need = np.zeros(N); need[0] = 10.0
+    g = pool.emergency_draw(2, s, need)
+    assert g[0] == pytest.approx(10.0) and pool.debt[0] == 0.0      # own money first: no debt
+    assert pool.personal[0] == pytest.approx(15.0)
+    refund = pool.on_exit(np.array([1]), s)
+    assert refund[1] == pytest.approx(25.0) and pool.personal[1] == 0.0
+    rel = pool.release_stakes()
+    assert rel[0] == pytest.approx(15.0) and pool.personal.sum() == 0.0

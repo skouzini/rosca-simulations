@@ -81,6 +81,7 @@ WEEKLY_COLUMNS: dict[str, str] = {
     "reserve": "$ pool reserve balance (0 for rigid/no_pool)",
     "pot": "$ undistributed rotating pot balance",
     "staked": "$ member-owned staked payouts held in reserve (C only)",
+    "personal": "$ member-owned personal emergency shares held by the pool",
     "seed_drawn": "$ institutional seed liquidity currently drawn/lost",
     "frozen": "bool, pool could not honor a payout or emergency draw this week",
     "collapsed": "bool, pool has collapsed (sticky once True)",

@@ -12,7 +12,7 @@ import streamlit as st
 
 from rosca import engine, metrics, params as params_mod
 from rosca.contracts import PRESETS, SHOCK_KINDS, ShockEvent
-from rosca.params import STRUCTURE_LABELS, STRUCTURES, SimParams
+from rosca.params import POPULATIONS, STRUCTURE_LABELS, STRUCTURES, SimParams
 
 st.set_page_config(page_title="Savings circle shock lab", page_icon="🛟", layout="wide")
 
@@ -25,15 +25,6 @@ MEMBER_STEPS = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_
 def rgba(hex_color: str, a: float) -> str:
     h = hex_color.lstrip("#")
     return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{a})"
-
-
-@st.cache_resource
-def engine_is_fake() -> bool:
-    try:
-        engine.run(SimParams(weeks=4), "no_pool", [], 0)
-        return False
-    except NotImplementedError:
-        return True
 
 
 @st.cache_data(show_spinner="Running Monte Carlo…")
@@ -51,7 +42,8 @@ def simulate(params_json: str, structures: tuple, shocks: tuple, n_runs: int, se
         w["health"] = metrics.health_index(r.weekly, p.pool, n).to_numpy()
         w["structure"], w["seed"] = r.structure, r.seed
         frames.append(w)
-    summary = metrics.summarize_many(results, p.pool, n)
+    calm = engine.run_many(p, list(structures), [], n_runs, seed) if events else None
+    summary = metrics.summarize_many(results, p.pool, n, calm)
     return pd.concat(frames, ignore_index=True), summary
 
 
@@ -168,16 +160,15 @@ def money(x: float) -> str:
 
 # ------------------------------------------------------------------ header
 st.title("Savings circle shock lab")
-st.markdown("Can a savings circle absorb a shock that would push members into **554% APR payday loans**? "
+st.markdown("Can a savings circle absorb a shock that would push members into **469% APR payday loans** (Utah average, 2025)? "
             "Apply a shock and watch each structure recover — or fail.")
-if engine_is_fake():
-    st.warning("Preview data: the simulation engine is still being built, so these results come from a "
-               "placeholder generator (`engine.fake_run`). Shapes are illustrative, not findings.", icon="🧪")
 
 # ------------------------------------------------------------------ sidebar
 base = SimParams()
 with st.sidebar:
     st.header("Scenario")
+    pop_key = st.selectbox("Worker population", list(POPULATIONS), format_func=lambda k: POPULATIONS[k][0])
+    st.caption(POPULATIONS[pop_key][1])
     structures = st.multiselect("Structures to compare", STRUCTURES, default=list(STRUCTURES),
                                 format_func=STRUCTURE_LABELS.get)
     with st.expander("Cohort", expanded=True):
@@ -186,9 +177,19 @@ with st.sidebar:
         miss = st.radio("When a member misses payments", ["demote", "expel"], horizontal=True,
                         index=["demote", "expel"].index(base.pool.miss_policy),
                         help="demote: moved to the back of the payout order · expel: removed after repeated misses")
+    with st.expander("Emergency fund", expanded=True):
+        fund = st.radio("Type", ["pooled", "personal", "both", "none"], horizontal=True,
+                        help="pooled: shared reserve any member can borrow from, repaid interest-free (B and C only) · "
+                             "personal: each member's own savings, withdrawable any time (A, B and C)")
+        beta = st.slider("Personal share of each payment", 0.0, 0.5, 0.25, 0.05, format="%.2f") \
+            if fund in ("personal", "both") else 0.0
+        alpha = st.slider("Pooled share of each payment", 0.0, 0.5, base.pool.reserve_frac, 0.05, format="%.2f",
+                          help="Applied after the personal share. Structure A has no pooled reserve.") \
+            if fund in ("pooled", "both") else 0.0
+        draw_cap = st.slider("Max pooled draw per member ($)", 250, 3000, int(base.pool.draw_cap), step=250,
+                             help="Biggest emergency loan a member can have outstanding from the pooled reserve") \
+            if fund in ("pooled", "both") else base.pool.draw_cap
     with st.expander("Structure B/C"):
-        alpha = st.slider("Reserve fraction α", 0.0, 0.5, base.pool.reserve_frac, 0.05,
-                          help="Share of each contribution routed to the emergency reserve")
         yld = st.slider("Staking yield (APR)", 0.0, 0.08, base.pool.staking_yield_apr, 0.005, format="%.3f")
         stake_p = st.slider("Stake probability", 0.0, 1.0, base.pool.stake_prob, 0.05,
                             help="Chance a member with no shortfall leaves their payout staked (C only)")
@@ -202,8 +203,9 @@ with st.sidebar:
 
 params = dataclasses.replace(
     base, weeks=weeks,
-    population=dataclasses.replace(base.population, cohort_size=cohort),
+    population=dataclasses.replace(base.population, cohort_size=cohort, **POPULATIONS[pop_key][2]),
     pool=dataclasses.replace(base.pool, contribution_weekly=float(contrib), reserve_frac=alpha,
+                             personal_share_frac=beta, draw_cap=float(draw_cap),
                              staking_yield_apr=yld, stake_prob=stake_p, seed_liquidity=float(seed_liq),
                              miss_policy=miss))
 
@@ -255,7 +257,8 @@ tab_shock, tab_econ, tab_assump, tab_sens = st.tabs(["Shock & recovery", "Impact
 
 g = summary.groupby("structure")
 shock_start = min((e.start_week for e in run_events), default=None)
-mttr_med = g.mttr_weeks.median()
+mttr_med = g.member_mttr_weeks.median()
+pool_mttr_med = g.mttr_weeks.median()
 recovery = {s: shock_start + mttr_med[s] for s in structs} if shock_start is not None else {}
 fees_pm = g.payday_fees.mean() / run_cohort
 
@@ -263,17 +266,21 @@ with tab_shock:
     st.caption(f"{run_n} Monte Carlo runs per structure · bands show the middle 80% of runs (p10–p90), line is the median · "
                "grey bands mark shock windows · dotted lines mark each structure's median recovery week.")
     for s in structs:
-        rec_rate = g.recovered.mean()[s]
+        rec_rate = g.member_recovered.mean()[s]
         never = 1 - rec_rate
         st.markdown(f"<span style='color:{COLORS[s]};font-size:1.2em'>●</span> **{STRUCTURE_LABELS[s]}**",
                     unsafe_allow_html=True)
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Time to recover (median)", "—" if shock_start is None else f"{mttr_med[s]:.0f} wks",
-                  help="Weeks from first shock until the health index is back within 5% of its pre-shock level "
-                       "for 4 straight weeks.")
-        c1.caption("no shock applied" if shock_start is None else f"{never:.0%} never recovered in horizon")
+        c1.metric("Members recover in (median)", "—" if shock_start is None else f"{mttr_med[s]:.0f} wks",
+                  help="Weeks from the first shock until the share of members in payday debt or missing bills is "
+                       "back within 5% of the same run without the shock, for 4 straight weeks. Comparable across "
+                       "all structures.")
+        c1.caption("no shock applied" if shock_start is None else
+                   f"{never:.0%} never recovered" + ("" if s == "no_pool" else
+                   f" · pool health recovers in {pool_mttr_med[s]:.0f} wks"))
         c2.metric("Survival rate", "n/a" if s == "no_pool" else f"{g.survived.mean()[s]:.0%}",
-                  help="Share of runs with no collapse and no frozen week.")
+                  help="Share of runs with no collapse and frozen (unable to pay a payout or draw) in at most "
+                       "10% of weeks.")
         base_fee = fees_pm.get("no_pool")
         c3.metric("Payday fees per member", money(fees_pm[s]),
                   delta=None if base_fee is None or s == "no_pool" else f"{money(fees_pm[s] - base_fee)} vs status quo",

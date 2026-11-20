@@ -60,11 +60,11 @@ class Pool:
         raise NotImplementedError
 
     def release_stakes(self) -> np.ndarray:
-        """Return all member-owned stakes (engine calls this once, on the final week). $ per agent (len n)."""
+        """Return all member-owned balances (stakes, personal shares); engine calls once on the final week."""
         return np.zeros(self.n)
 
     def snapshot(self) -> dict:
-        """Keys: reserve, pot, staked, seed_drawn, frozen, collapsed (see contracts.WEEKLY_COLUMNS)."""
+        """Keys: reserve, pot, staked, personal, seed_drawn, frozen, collapsed (see contracts.WEEKLY_COLUMNS)."""
         raise NotImplementedError
 
 
@@ -95,7 +95,7 @@ class NoPool(Pool):
         return 0.0
 
     def snapshot(self):
-        return dict(reserve=0.0, pot=0.0, staked=0.0, seed_drawn=0.0, frozen=False, collapsed=False)
+        return dict(reserve=0.0, pot=0.0, staked=0.0, personal=0.0, seed_drawn=0.0, frozen=False, collapsed=False)
 
 
 EPS = 1e-9
@@ -125,7 +125,7 @@ class _Rotating(Pool):
     not in due(), because emergency_draw runs before due() and its freeze must reach the snapshot.
     A freeze raised by on_exit/release_stakes carries into the next week's first call.
     """
-    alpha = 0.0  # share of each contribution routed to reserve
+    alpha = 0.0  # share of each contribution (after the personal share) routed to reserve
 
     def __init__(self, params, n, rng):
         super().__init__(params, n, rng)
@@ -141,6 +141,8 @@ class _Rotating(Pool):
         self.owed = np.zeros(n)       # withheld payout owed back (B)
         self.stake = np.zeros(n)      # member-owned staked balance (C)
         self.pending = np.zeros(n)    # refunds paid in the next payout() (stakes of expelled members)
+        self.beta = params.personal_share_frac
+        self.personal = np.zeros(n)   # member-owned emergency share (dual-track design), always withdrawable
         self._week = None
         self._carry_frozen = False
 
@@ -150,7 +152,8 @@ class _Rotating(Pool):
             self._week, self.frozen, self._carry_frozen = week, self._carry_frozen, False
 
     def full_pot(self, state):
-        return state.active.sum() * self.p.contribution_weekly * self.p.round_weeks * (1 - self.alpha)
+        return (state.active.sum() * self.p.contribution_weekly * self.p.round_weeks
+                * (1 - self.beta) * (1 - self.alpha))
 
     def _check_size(self, state):
         if state.active.sum() < self.p.collapse_min_frac * self.start_members:
@@ -159,9 +162,23 @@ class _Rotating(Pool):
     def _refund_stakes(self, idx):
         return np.zeros(self.n)
 
+    def _refund_own(self, idx):
+        """Return member-owned balances: staked payouts (C) and personal emergency shares."""
+        idx = np.atleast_1d(np.asarray(idx, dtype=int))
+        out = self._refund_stakes(idx)
+        out[idx] += self.personal[idx]
+        self.personal[idx] = 0.0
+        return out
+
+    def _own_personal(self, i, want, granted):
+        x = min(want, self.personal[i])
+        self.personal[i] -= x
+        granted[i] += x
+        return x
+
     def _remove(self, idx, state):
         idx = np.atleast_1d(np.asarray(idx, dtype=int))
-        refund = self._refund_stakes(idx)
+        refund = self._refund_own(idx)
         state.active[idx] = False
         self.queue = [m for m in self.queue if state.active[m]]
         self.debt[idx] = self.inst[idx] = self.owed[idx] = 0.0
@@ -169,7 +186,7 @@ class _Rotating(Pool):
         return refund
 
     def _liquidate(self, state):
-        out = self._refund_stakes(np.flatnonzero(self.stake > 0))
+        out = self._refund_own(np.arange(self.n))
         rest = self.pot + self.reserve
         w = self.round_paid * state.active
         if w.sum() <= 0:
@@ -191,8 +208,10 @@ class _Rotating(Pool):
         paid = np.asarray(paid, dtype=float)
         contrib = np.minimum(paid, np.where(due > 0, self.p.contribution_weekly, 0.0))
         repay = paid - contrib
-        self.pot += contrib.sum() * (1 - self.alpha)
-        self.reserve += contrib.sum() * self.alpha + repay.sum()
+        self.personal += contrib * self.beta
+        shared = contrib.sum() * (1 - self.beta)
+        self.pot += shared * (1 - self.alpha)
+        self.reserve += shared * self.alpha + repay.sum()
         self.debt -= np.minimum(repay, self.debt)
         self.round_paid += contrib
         missed = np.flatnonzero(state.active & (paid < due - EPS))
@@ -210,7 +229,10 @@ class _Rotating(Pool):
 
     def emergency_draw(self, week, state, need):
         self._tick(week)
-        return np.zeros(self.n)
+        granted = np.zeros(self.n)
+        for i in np.flatnonzero(state.active & (np.asarray(need) > EPS)):
+            self._own_personal(i, need[i], granted)
+        return granted
 
     def payout(self, week, state):
         self._tick(week)
@@ -241,13 +263,19 @@ class _Rotating(Pool):
         return lost
 
     def holdings(self):
-        return self.pot + self.reserve + self.seed_left + self.pending.sum()
+        return self.pot + self.reserve + self.seed_left + self.pending.sum() + self.personal.sum()
+
+    def release_stakes(self):
+        refund = self._refund_own(np.arange(self.n))
+        self._carry_frozen |= self.frozen
+        return refund
 
     def seed_drawn(self):
         return self.p.seed_liquidity - self.seed_left
 
     def snapshot(self):
         return dict(reserve=float(self.reserve), pot=float(self.pot), staked=float(self.stake.sum()),
+                    personal=float(self.personal.sum()),
                     seed_drawn=float(self.seed_drawn()), frozen=bool(self.frozen), collapsed=bool(self.collapsed))
 
     # ---- structure hooks
@@ -317,7 +345,8 @@ class _ReservePool(_Rotating):
             return granted
         need = np.asarray(need, dtype=float)
         for i in np.flatnonzero(state.active & (need > EPS)):
-            rem = need[i] - self._own_stake(i, need[i], granted)
+            rem = need[i] - self._own_personal(i, need[i], granted)
+            rem -= self._own_stake(i, rem, granted)
             room = min(rem, self.p.draw_cap - self.debt[i])
             if room <= EPS:
                 continue
@@ -432,11 +461,6 @@ class ReserveStaking(_ReservePool):
         self.reserve -= out.sum()
         self.stake[idx] = 0.0
         return out
-
-    def release_stakes(self):
-        refund = self._refund_stakes(np.flatnonzero(self.stake > 0))
-        self._carry_frozen |= self.frozen
-        return refund
 
 POOLS: dict[str, type[Pool]] = {
     "no_pool": NoPool,

@@ -11,7 +11,7 @@ from rosca.params import EconParams, PoolParams, SimParams
 KEYS = ("structure seed mttr_weeks recovered payday_loans payday_borrowed payday_fees share_used_payday "
         "weeks_in_debt_per_borrower loans_per_borrower cycle_completed attrition miss_rate frozen_weeks "
         "max_reserve_drawdown avg_payout self_coverage_rate hardship_weeks avg_pool_balance seed_drawn_max "
-        "survived mttr_censored payday_fees_per_member").split()
+        "survived mttr_censored payday_fees_per_member member_mttr_weeks member_recovered").split()
 
 
 def h(*vals):
@@ -70,7 +70,7 @@ def synth_weekly(collapsed, reserve=0.0, due=600.0, paid=600.0, debt=0, active=1
 
 
 def test_health_components():
-    pool = PoolParams()  # full pot = 12 × 50 × 2 = 1200
+    pool = PoolParams(contribution_weekly=50.0)  # full pot = 12 × 50 × 2 = 1200
     w = synth_weekly([False] * 4, reserve=600.0, paid=300.0, debt=6, active=9)
     # reserve .5, on-time .5, payday 1−.5, retention .75
     assert np.allclose(metrics.health_index(w, pool, 12), (0.5 + 0.5 + 0.5 + 0.75) / 4)
@@ -80,7 +80,7 @@ def test_health_components():
 
 
 # ---------------------------------------------------------------- summarize
-def test_summarize_fake_run():
+def test_summarize_real_run():
     p = SimParams()
     res = engine.run_many(p, ["no_pool", "rigid", "reserve_staking"], PRESETS["Plant layoff"], 3)
     df = metrics.summarize_many(res, p.pool, p.population.cohort_size)
@@ -92,7 +92,7 @@ def test_summarize_fake_run():
 
 def test_summarize_no_shocks_mttr_nan():
     p = SimParams()
-    s = metrics.summarize_run(engine.fake_run(p, "rigid", [], 1), p.pool, 12)
+    s = metrics.summarize_run(engine.run(p, "rigid", [], 1), p.pool, 12)
     assert set(KEYS) == set(s) and math.isnan(s["mttr_weeks"])
 
 
@@ -165,3 +165,10 @@ def test_bands():
     hb = metrics.health_bands(res, p.pool, 12)
     assert hb.shape == (52, 6) and ((hb >= 0) & (hb <= 1)).all().all()
     assert (hb[("variable_payout", 0.1)] <= hb[("variable_payout", 0.9)]).all()
+
+
+def test_recovery_against_counterfactual_baseline():
+    # shocked run dips then tracks the calm run, which itself is ramping up: recovery measured per week
+    calm = h(.2, .4, .6, .8, .9, 1, 1, 1, 1, 1)
+    shocked = h(.2, .4, .3, .4, .6, .99, 1, 1, 1, 1)
+    assert metrics.recovery_time(shocked, 2, baseline=calm) == (3.0, True)

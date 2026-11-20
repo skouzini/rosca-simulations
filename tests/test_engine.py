@@ -56,7 +56,7 @@ class FakePool(Pool):
         return self.pot + self.reserve
 
     def snapshot(self):
-        return dict(reserve=self.reserve, pot=self.pot, staked=0.0, seed_drawn=0.0, frozen=False, collapsed=False)
+        return dict(reserve=self.reserve, pot=self.pot, staked=0.0, personal=0.0, seed_drawn=0.0, frozen=False, collapsed=False)
 
 
 @pytest.fixture
@@ -127,18 +127,9 @@ def test_no_shocks_large_buffers_no_payday():
         assert r.weekly.hardship_members.sum() == 0
 
 
-def test_run_many_keeps_fake_fallback_for_unimplemented_pools():
-    # fallback triggers only when the first structure's pool raises NotImplementedError
-    res = run_many(SimParams(), ["no_pool"], [], 2)
-    assert len(res) == 2 and hasattr(res[0], "ledger")  # real engine
-    if not hasattr(pools.RigidROSCA, "due") or pools.RigidROSCA.due is Pool.due:
-        res = run_many(SimParams(), ["rigid", "no_pool"], [], 1)
-        assert len(res) == 2
-
-
 # ---------------------------------------------------------------- payday book
 def test_payday_repay_renew_default_epp():
-    p = PaydayParams(renew_prob=0.5, default_prob_when_unable=0.5)
+    p = PaydayParams(loan_size=375.0, fee_per_100=21.0, renew_prob=0.5, default_prob_when_unable=0.5)
     book = PaydayBook(p, 4)
     cash = np.zeros(4)
     lent = book.borrow(0, np.array([100.0, 400.0, 100.0, 100.0]), np.ones(4, bool), cash)
