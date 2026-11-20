@@ -172,12 +172,13 @@ def test_snapshot_keys_and_types():
 @pytest.mark.parametrize("policy", ["expel", "demote"])
 @pytest.mark.parametrize("seed", range(5))
 @pytest.mark.parametrize("beta", [0.0, 0.25])
-def test_conservation_every_week(cls, policy, seed, beta):
+@pytest.mark.parametrize("pot_advance", [False, True])
+def test_conservation_every_week(cls, policy, seed, beta, pot_advance):
     """Δholdings == paid_in − granted − payouts − refunds − lost reserve, every week."""
     rng = np.random.default_rng(seed)
     pool = make(cls, seed=seed, miss_policy=policy, seed_liquidity=200.0 * (seed % 2),
                 collapse_min_frac=0.3 if seed < 3 else 0.5, stake_cash_threshold=300,
-                personal_share_frac=beta)
+                personal_share_frac=beta, pot_advance=pot_advance and cls is not RigidROSCA)
     s = make_state(cash=rng.uniform(0, 1500))
     for w in range(52):
         h0, flows = pool.holdings(), 0.0
@@ -219,3 +220,46 @@ def test_personal_share_split_draw_and_refund(cls):
     assert refund[1] == pytest.approx(25.0) and pool.personal[1] == 0.0
     rel = pool.release_stakes()
     assert rel[0] == pytest.approx(15.0) and pool.personal.sum() == 0.0
+
+
+# ---------------------------------------------------------------- payout-pot advances (B, C)
+@pytest.mark.parametrize("cls", [VariablePayout, ReserveStaking])
+def test_pot_advance_deducted_from_own_payout(cls):
+    pool = make(cls, reserve_frac=0.0, pot_advance=True, stake_prob=0.0)  # personal → pot → payday design
+    s = make_state()
+    week(pool, s, 0)                                   # pot = 6 × 50 = 300 after week 0
+    last = pool.queue[-1]                              # paid last this cycle
+    need = np.zeros(N); need[last] = 200.0
+    g = pool.emergency_draw(1, s, need)
+    assert g[last] == pytest.approx(200.0) and pool.adv[last] == pytest.approx(200.0)
+    assert pool.debt[last] == 0.0 and not pool.frozen  # no reserve in this design: no freeze
+    paid = {}
+    for w in range(1, 2 * N):
+        out = week(pool, s, w) if w > 1 else (pool.collect(1, s, pool.due(1, s)), pool.payout(1, s))[1]
+        for i in np.flatnonzero(out > 0):
+            paid[i] = paid.get(i, 0) + out[i]
+    if cls is ReserveStaking:   # fixed payout: advance deducted from own lump sum
+        assert paid[last] == pytest.approx(FULL - 200.0, abs=1.0)
+    else:                       # B scales payouts by reserve health; the shortfall is recorded as owed
+        assert paid[last] + 200.0 + pool.owed[last] == pytest.approx(FULL, abs=1.0)
+    assert pool.adv[last] == 0.0
+
+
+@pytest.mark.parametrize("cls", [VariablePayout, ReserveStaking])
+def test_pot_draw_after_payout_is_debt(cls):
+    pool = make(cls, reserve_frac=0.0, pot_advance=True, stake_prob=0.0)
+    s = make_state()
+    week(pool, s, 0); week(pool, s, 1)                 # first member paid
+    first = pool.order[0]
+    week(pool, s, 2)
+    need = np.zeros(N); need[first] = 100.0
+    g = pool.emergency_draw(3, s, need)
+    assert g[first] == pytest.approx(100.0) and pool.debt[first] == pytest.approx(100.0)
+
+
+def test_rigid_ignores_pot_advance():
+    pool = make(RigidROSCA, pot_advance=True)
+    s = make_state()
+    week(pool, s, 0)
+    need = np.full(N, 100.0)
+    assert pool.emergency_draw(1, s, need).sum() == 0.0

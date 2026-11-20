@@ -189,6 +189,10 @@ with st.sidebar:
         draw_cap = st.slider("Max pooled draw per member ($)", 250, 3000, int(base.pool.draw_cap), step=250,
                              help="Biggest emergency loan a member can have outstanding from the pooled reserve") \
             if fund in ("pooled", "both") else base.pool.draw_cap
+        pot_adv = st.checkbox("Then advance from the payout pot (B, C)", value=False,
+                              help="Last tier before payday loans: a member draws an advance on their own upcoming "
+                                   "lump sum (deducted when they're paid), or borrows from the pot if already paid. "
+                                   "Draw order: personal fund → pooled reserve → payout pot → payday loan.")
     with st.expander("Structure B/C"):
         yld = st.slider("Staking yield (APR)", 0.0, 0.08, base.pool.staking_yield_apr, 0.005, format="%.3f")
         stake_p = st.slider("Stake probability", 0.0, 1.0, base.pool.stake_prob, 0.05,
@@ -205,7 +209,7 @@ params = dataclasses.replace(
     base, weeks=weeks,
     population=dataclasses.replace(base.population, cohort_size=cohort, **POPULATIONS[pop_key][2]),
     pool=dataclasses.replace(base.pool, contribution_weekly=float(contrib), reserve_frac=alpha,
-                             personal_share_frac=beta, draw_cap=float(draw_cap),
+                             personal_share_frac=beta, draw_cap=float(draw_cap), pot_advance=pot_adv,
                              staking_yield_apr=yld, stake_prob=stake_p, seed_liquidity=float(seed_liq),
                              miss_policy=miss))
 
@@ -343,11 +347,64 @@ with tab_assump:
     st.dataframe(param_table(params), hide_index=True, width="stretch",
                  column_config={"source": st.column_config.TextColumn("source", width="large")})
 
+SENS_OUTCOMES = {  # column: (label, format, higher_is_better)
+    "fee_reduction": ("Payday fees avoided vs status quo", ".0%", True),
+    "survival": ("Pool survival rate", ".0%", True),
+    "member_mttr": ("Weeks for members to recover", ".0f", False),
+    "member_recovered": ("Share of runs where members recover", ".0%", True),
+    "pool_mttr": ("Weeks for pool health to recover", ".0f", False),
+}
+FACTOR_LABELS = {
+    "contribution_weekly": "Weekly contribution", "cohort_size": "Members per circle",
+    "personal_share_frac": "Personal fund share", "reserve_frac": "Pooled reserve share",
+    "pot_advance": "Payout-pot advances on", "draw_cap": "Max pooled draw", "seed_liquidity": "Sponsor seed money",
+    "payout_floor": "B: minimum payout", "stake_prob": "C: staking probability",
+    "expense_rate_per_year": "Expense shocks per year", "job_loss_rate_per_year": "Job-loss rate",
+    "buffer_median": "Members' starting savings", "margin_mean": "Members' monthly surplus",
+    "payday_propensity": "Tendency to use payday loans",
+}
+
 with tab_sens:
-    path = Path(__file__).parent / "results" / "sensitivity.parquet"
-    if path.exists():
-        st.markdown("Sensitivity sweep results from `results/sensitivity.parquet`.")
-        st.dataframe(pd.read_parquet(path), width="stretch")
+    res = Path(__file__).parent / "results"
+    if not (res / "sensitivity.parquet").exists():
+        st.info("Run `python3 -m experiments.sensitivity` to generate the factor analysis.")
     else:
-        st.info("Sensitivity results load from `results/sensitivity.parquet` when present. "
-                "Run the sensitivity experiment to generate them.")
+        raw, eff = pd.read_parquet(res / "sensitivity.parquet"), pd.read_parquet(res / "sensitivity_effects.parquet")
+        n_samp = raw["sample"].nunique()
+        st.markdown(f"**What drives shock resistance and recovery?** {n_samp} randomly sampled scenarios "
+                    "(Latin hypercube over every factor below, timing-mismatch population, plant-layoff shock), each "
+                    "run on the same seeds for every structure, with and without the shock.")
+        c1, c2 = st.columns(2)
+        outcome = c1.selectbox("Outcome", list(SENS_OUTCOMES), format_func=lambda k: SENS_OUTCOMES[k][0])
+        sens_struct = c2.selectbox("Structure", [s for s in STRUCTURES if s != "no_pool"],
+                                   index=2, format_func=STRUCTURE_LABELS.get)
+        label, fmt, up = SENS_OUTCOMES[outcome]
+        e = eff[(eff.structure == sens_struct) & (eff.outcome == outcome)].dropna(subset=["rho"])
+        e = e.assign(good=e.rho * (1 if up else -1)).sort_values("rho", key=abs)
+        fig = go.Figure(go.Bar(
+            x=e.good, y=[FACTOR_LABELS.get(f, f) for f in e.factor], orientation="h",
+            marker_color=["#1baf7a" if v > 0 else "#d6452a" for v in e.good],
+            marker_pattern_shape=["" if g == "design" else "/" for g in e.group],
+            hovertemplate="%{y}: rank correlation %{customdata:.2f}<extra></extra>", customdata=e.rho))
+        fig.update_layout(height=60 + 28 * len(e), margin=dict(l=10, r=10, t=40, b=30),
+                          title=f"Effect on: {label}", xaxis=dict(range=[-1, 1], title="← hurts · helps →"))
+        st.plotly_chart(fig, width="stretch")
+        st.caption("Bar length = Spearman rank correlation between the factor and the outcome across scenarios "
+                   "(green helps, red hurts). Solid bars are design choices a sponsor controls; hatched bars are "
+                   "the environment (members' finances and shocks).")
+
+        factor = st.selectbox("Look closer at one factor", list(e.factor[::-1]), format_func=lambda f: FACTOR_LABELS.get(f, f))
+        fig2 = go.Figure()
+        for s in [s for s in STRUCTURES if s != "no_pool"]:
+            d = raw[raw.structure == s]
+            fig2.add_trace(go.Scatter(x=d[factor].astype(float), y=d[outcome], mode="markers", name=STRUCTURE_LABELS[s],
+                                      marker=dict(color=COLORS[s], size=5, opacity=0.35), legendgroup=s, showlegend=False))
+            bins = pd.qcut(d[factor].astype(float).rank(method="first"), 8, labels=False)
+            m = d.groupby(bins).agg(x=(factor, lambda v: v.astype(float).median()), y=(outcome, "median"))
+            fig2.add_trace(go.Scatter(x=m.x, y=m.y, mode="lines+markers", name=STRUCTURE_LABELS[s], legendgroup=s,
+                                      line=dict(color=COLORS[s], width=3)))
+        fig2.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=40), xaxis_title=FACTOR_LABELS.get(factor, factor),
+                           yaxis=dict(title=label, tickformat=fmt if "%" in fmt else None),
+                           legend=dict(orientation="h", y=1.08))
+        st.plotly_chart(fig2, width="stretch")
+        st.caption("Dots are individual scenarios; lines are the median within eight equal-size bins of the factor.")

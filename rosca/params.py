@@ -90,6 +90,8 @@ class PoolParams:
     target_reserve_pots: float = 1.0      # target reserve = this × one pot
     draw_cap: float = 500.0               # max outstanding emergency draw per member. ASSUMPTION
     draw_repay_weeks: int = 8             # emergency draw repaid evenly over this many weeks
+    pot_advance: bool = False             # allow emergency advances from the rotating payout pot (last tier
+                                          # before payday), deducted from the member's own payout. B and C only
     # B only
     payout_floor: float = 0.7             # payout multiplier when reserve health h = 0
     # C only

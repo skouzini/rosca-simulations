@@ -321,15 +321,26 @@ class _ReservePool(_Rotating):
     by the reserve, with g(h) = clip(h, 0.25, 1) — a linear utilization curve: as the reserve is used up
     grants are rationed proportionally, with a 25% floor so a non-empty reserve always lends something.
     Grants become debt repaid in installments of debt / draw_repay_weeks (recomputed on each new grant),
-    added to due(). frozen=True if a draw is requested but the reserve is empty.
+    added to due().
+
+    Draw order (the waterfall inside the pool): personal emergency share → own stake (C) → pooled
+    reserve → payout pot (only if pot_advance) → engine falls back to payday. Pot tier: a member still
+    waiting for their payout this cycle takes an *advance* on it (up to full net pot − advances already
+    taken), deducted from that payout; a member already paid this cycle borrows from the pot as ordinary
+    draw debt (within draw_cap), repaid in installments. Advances are forfeited if the member exits.
+    frozen=True if the design has a pooled reserve (reserve_frac > 0 or seed) and a draw still went
+    unmet with the reserve empty. Designs without a pooled reserve never freeze on draws.
     The round payout tops a short pot up from the reserve; leftover pot goes to the reserve. A payout
-    below 50% of the full net pot collapses the pool; any other shortfall vs target sets frozen.
+    (cash + the recipient's advance) below 50% of the full net pot collapses the pool; any other
+    shortfall vs target sets frozen.
     """
 
     def __init__(self, params, n, rng):
         super().__init__(params, n, rng)
         self.alpha = params.reserve_frac
         self.reserve = float(params.seed_liquidity)
+        self.adv = np.zeros(n)  # pot advances against this cycle's payout (pot_advance)
+        self.has_reserve = params.reserve_frac > 0 or params.seed_liquidity > 0
 
     def health(self, state):
         target = self.p.target_reserve_pots * self.full_pot(state)
@@ -348,17 +359,36 @@ class _ReservePool(_Rotating):
             rem = need[i] - self._own_personal(i, need[i], granted)
             rem -= self._own_stake(i, rem, granted)
             room = min(rem, self.p.draw_cap - self.debt[i])
-            if room <= EPS:
-                continue
-            if self.reserve <= EPS:
+            if room > EPS and self.reserve > EPS:
+                x = min(room * np.clip(self.health(state), 0.25, 1.0), self.reserve)
+                self.reserve -= x
+                self._borrow(i, x)
+                granted[i] += x
+                rem -= x
+            if rem > EPS and self.p.pot_advance:
+                rem -= self._pot_draw(i, rem, granted, state)
+            if rem > EPS and self.has_reserve and self.reserve <= EPS:
                 self.frozen = True
-                continue
-            x = min(room * np.clip(self.health(state), 0.25, 1.0), self.reserve)
-            self.reserve -= x
-            self.debt[i] += x
-            self.inst[i] = self.debt[i] / self.p.draw_repay_weeks
-            granted[i] += x
         return granted
+
+    def _borrow(self, i, x):
+        self.debt[i] += x
+        self.inst[i] = self.debt[i] / self.p.draw_repay_weeks
+
+    def _pot_draw(self, i, want, granted, state):
+        if i in self.queue:  # advance on own upcoming payout
+            x = min(want, max(self.full_pot(state) - self.adv[i], 0.0), self.pot)
+            self.adv[i] += x
+        else:                # already paid this cycle: ordinary draw debt from the pot
+            x = min(want, max(self.p.draw_cap - self.debt[i], 0.0), self.pot)
+            self._borrow(i, x)
+        self.pot -= x
+        granted[i] += x
+        return x
+
+    def _remove(self, idx, state):
+        self.adv[np.atleast_1d(np.asarray(idx, dtype=int))] = 0.0
+        return super()._remove(idx, state)
 
     def _own_stake(self, i, want, granted):
         return 0.0
@@ -369,17 +399,24 @@ class _ReservePool(_Rotating):
     def _pay_round(self, i, state):
         full = self.full_pot(state)
         target = self._target(full, state)
-        amt = min(target, self.pot + self.reserve)
-        if amt < 0.5 * full - EPS:
+        a, self.adv[i] = self.adv[i], 0.0
+        if a > target:  # advance exceeds what this payout turned out to be: rest becomes draw debt
+            self._borrow(i, a - target)
+            a = target
+        amt = min(target - a, self.pot + self.reserve)
+        if amt + a < 0.5 * full - EPS:
             self.collapsed = self.frozen = True
+            if a:
+                self._borrow(i, a)  # payout never happened: advance stays owed
             return 0.0
-        self.frozen |= amt < target - EPS
+        self.frozen |= amt < target - a - EPS
         self.reserve += self.pot - amt
         self.pot = 0.0
-        return self._after_payout(i, amt, full, state)
+        return self._after_payout(i, amt, amt + a, full, state)
 
-    def _after_payout(self, i, amt, full, state):
-        return amt
+    def _after_payout(self, i, cash, total, full, state):
+        """cash: paid now; total: cash + advance already taken against this payout."""
+        return cash
 
 
 class VariablePayout(_ReservePool):
@@ -394,9 +431,9 @@ class VariablePayout(_ReservePool):
     def _target(self, full, state):
         return full * (self.p.payout_floor + (1 - self.p.payout_floor) * min(self.health(state), 1.0))
 
-    def _after_payout(self, i, amt, full, state):
-        self.owed[i] += max(0.0, full - amt)
-        return amt
+    def _after_payout(self, i, cash, total, full, state):
+        self.owed[i] += max(0.0, full - total)
+        return cash
 
     def _cycle_end(self, state):
         out = np.zeros(self.n)
@@ -435,12 +472,12 @@ class ReserveStaking(_ReservePool):
         granted[i] += x
         return x
 
-    def _after_payout(self, i, amt, full, state):
-        if amt > 0 and state.cash[i] >= self.p.stake_cash_threshold and self.rng.random() < self.p.stake_prob:
-            self.stake[i] += amt
-            self.reserve += amt
+    def _after_payout(self, i, cash, total, full, state):
+        if cash > 0 and state.cash[i] >= self.p.stake_cash_threshold and self.rng.random() < self.p.stake_prob:
+            self.stake[i] += cash
+            self.reserve += cash
             return 0.0
-        return amt
+        return cash
 
     def _weekly(self, state):
         y = self.stake * self.p.staking_yield_apr / WEEKS_PER_YEAR
