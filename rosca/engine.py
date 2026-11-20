@@ -116,12 +116,15 @@ def run(params: SimParams, structure: str, shocks: list[ShockEvent], seed: int) 
 def run_many(params: SimParams, structures: list[str], shocks: list[ShockEvent],
              n_runs: int, seed: int = 0) -> list[RunResult]:
     """Run n_runs seeds (seed, seed+1, ...) for each structure. Same seeds across structures."""
-    runner = run
-    try:
-        run(params, structures[0], shocks, seed)
-    except NotImplementedError:
-        runner = fake_run  # shortcut: remove fallback once engine.run lands
-    return [runner(params, s, shocks, seed + i) for s in structures for i in range(n_runs)]
+    out = []
+    for s in structures:
+        runner = run
+        try:
+            run(params, s, shocks, seed)
+        except NotImplementedError:
+            runner = fake_run  # shortcut: remove fallback once all pools land
+        out += [runner(params, s, shocks, seed + i) for i in range(n_runs)]
+    return out
 
 
 # ---------------------------------------------------------------- fake data for dashboard development
